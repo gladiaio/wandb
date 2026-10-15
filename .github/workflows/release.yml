@@ -13,8 +13,11 @@ on:
         type: boolean
         default: false
 
+# Read-only by default: the build job runs upstream main's build code (hatch hooks, Go, Rust, an import
+# of the wheel), so no job that runs it may hold a write token. Only the jobs that run none of it
+# (sync, release, notify) are given more, below.
 permissions:
-  contents: write
+  contents: read
 
 env:
   RUST_TOOLCHAIN: "1.88.0" # as upstream's release (xpu/Cargo.lock requires 1.88)
@@ -29,6 +32,8 @@ jobs:
   sync:
     name: Sync main with upstream
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       # GITHUB_TOKEN cannot update .github/workflows: when upstream changed one, the merge needs
       # SYNC_TOKEN (a token with the workflow scope on this repository)
@@ -52,6 +57,8 @@ jobs:
       build: ${{ steps.plan.outputs.build }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - id: plan
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -97,13 +104,17 @@ jobs:
           - { arch: x86_64, runner: ubuntu-24.04, go_arch: linux-amd64 }
           - { arch: aarch64, runner: ubuntu-24.04-arm, go_arch: linux-arm64 }
     steps:
+      # persist-credentials: false on both checkouts: the build below runs upstream's code, which must
+      # find no token in either .git/config
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: gladia
+          persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ needs.plan.outputs.main }}
           path: src
+          persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: stable
@@ -149,8 +160,12 @@ jobs:
     name: Scan and release
     needs: [plan, build]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write  # gh release create; the wheels are scanned and uploaded here, never run
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: wheel-*

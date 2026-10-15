@@ -31,6 +31,14 @@ the **latest release**, with no pin. They rely on this:
 Install by hand: resolve the latest tag (`https://github.com/gladiaio/wandb/releases/latest` redirects to
 it), check the wheel against that release's `SHA256SUMS`, then `uv pip install --no-deps <wheel>`.
 
+Rolling back a bad release: delete it (`gh release delete <tag> --cleanup-tag -R gladiaio/wandb`) or
+mark the previous one Latest (`gh release edit <tag> --latest`). An image build can pin one with
+`WANDB_RELEASE=<tag>` (gladia-enterprise `inference/docker/build_unified.sh`).
+
+Token scopes: the workflow is read-only by default. The `build` job runs upstream `main`'s build code
+(hatch hooks, Go, Rust, an import of the wheel), so it gets no write scope and its checkouts persist no
+credentials; only `sync`, `release` (which only scans and uploads the wheels) and `notify` write.
+
 New finding in wandb-core: add the floor to `patch.sh` and merge it: the next run (or
 `gh workflow run release.yml -R gladiaio/wandb`) builds a new release. Once upstream `main` carries the
 fix itself, `patch.sh` changes nothing and the build is upstream's code with our version label.
