@@ -18,6 +18,7 @@ MODULES=(
 lt() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" = "$1" ]; }
 
 cd core
+before="$(go list -mod=mod -m all)"
 have_go="$(go mod edit -json | python3 -c 'import json,sys; print(json.load(sys.stdin)["Go"])')"
 if lt "$have_go" "$GO_MIN"; then
     echo "go directive: $have_go -> $GO_MIN"
@@ -25,13 +26,29 @@ if lt "$have_go" "$GO_MIN"; then
 fi
 for spec in "${MODULES[@]}"; do
     mod="${spec%@*}" want="${spec#*@}"
-    have="$(go list -m -f '{{.Version}}' "$mod")"
+    have="$(go list -mod=mod -m -f '{{.Version}}' "$mod")"
     if lt "${have#v}" "${want#v}"; then
         echo "$mod: $have -> $want"
         go get "$spec"
     fi
 done
 go mod tidy
+# wandb-core builds with -mod=vendor, and upstream patched some vendored code by hand (arrow-go): a
+# full `go mod vendor` would drop that. Only the modules whose version changed are re-vendored.
+after="$(go list -mod=mod -m all)"
+fresh="$(mktemp -d)/vendor"
+go mod vendor -o "$fresh"
+for mod in $(comm -13 <(sort <<<"$before") <(sort <<<"$after") | cut -d' ' -f1); do
+    rm -rf "vendor/$mod"
+    if [ -d "$fresh/$mod" ]; then
+        mkdir -p "vendor/$(dirname "$mod")"
+        cp -R "$fresh/$mod" "vendor/$mod"
+        echo "re-vendored $mod"
+    fi
+done
+cp "$fresh/modules.txt" vendor/modules.txt
+rm -rf "$(dirname "$fresh")"
+go build -mod=vendor -tags "disable_grpc_modules parquet_read_only" -o /dev/null ./cmd/wandb-core
 cd ..
 
 base="$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' wandb/__init__.py)"
