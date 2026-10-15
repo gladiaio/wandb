@@ -1,25 +1,25 @@
 name: Sync and release
 
-# Every day: mirror upstream main into main, then build the latest upstream release with patch.sh
-# (Gladia's security floor) unless that build is already released. See README.md.
+# Every day: mirror upstream main into main, then build main with patch.sh (Gladia's security floor)
+# when main or patch.sh changed since the latest release. Images install the latest release
+# (gladia-enterprise inference/docker/security_floor.sh): see README.md for that contract.
 on:
   schedule:
     - cron: "41 2 * * *"  # 02:41 UTC, before gladia-enterprise's nightly image scan (03:17)
   workflow_dispatch:
     inputs:
-      version:
-        description: upstream version to build (default the latest release), e.g. 0.30.0
-        required: false
       force:
-        description: rebuild and replace the release when it exists
+        description: build and release main even when nothing changed since the latest release
         type: boolean
         default: false
 
+# Read-only by default: the build job runs upstream main's build code (hatch hooks, Go, Rust, an import
+# of the wheel), so no job that runs it may hold a write token. Only the jobs that run none of it
+# (sync, release, notify) are given more, below.
 permissions:
-  contents: write
+  contents: read
 
 env:
-  REV: "1"                 # bump when patch.sh changes: rebuilds the current upstream release
   RUST_TOOLCHAIN: "1.88.0" # as upstream's release (xpu/Cargo.lock requires 1.88)
   TRIVY_VERSION: "0.75.0"
   TRIVY_SHA256: c6e65abddb348e25f10549df887045629cf28cc72453cd1c63acb717316b3f3f
@@ -32,6 +32,8 @@ jobs:
   sync:
     name: Sync main with upstream
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       # GITHUB_TOKEN cannot update .github/workflows: when upstream changed one, the merge needs
       # SYNC_TOKEN (a token with the workflow scope on this repository)
@@ -39,31 +41,55 @@ jobs:
           GH_TOKEN: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
         run: gh api -X POST "repos/${GITHUB_REPOSITORY}/merge-upstream" -f branch=main
 
+  # What to build: main (after the sync) with this branch's patch.sh, unless the latest release was
+  # built from the same two (its notes carry `source: main=<sha> patch=<blob sha>`). The version is
+  # main's __version__ with the local label gladia.<UTC date>[.<n>]: a release is never replaced, so a
+  # second build the same day takes the next free counter.
   plan:
     name: Plan
+    needs: sync
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.plan.outputs.version }}
+      main: ${{ steps.plan.outputs.main }}
+      label: ${{ steps.plan.outputs.label }}
       tag: ${{ steps.plan.outputs.tag }}
+      source: ${{ steps.plan.outputs.source }}
       build: ${{ steps.plan.outputs.build }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - id: plan
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ inputs.version }}
           FORCE: ${{ inputs.force }}
         run: |
-          version="${VERSION#v}"
-          [ -n "$version" ] || version="$(gh api repos/wandb/wandb/releases/latest -q .tag_name)" && version="${version#v}"
-          tag="v${version}-gladia.${REV}"
+          main="$(gh api "repos/${GITHUB_REPOSITORY}/commits/main" -q .sha)"
+          patch="$(git rev-parse HEAD:patch.sh)"
+          source="source: main=${main} patch=${patch}"
+          # no release yet, or one without a source line (built from an upstream tag): changed
+          latest="$(gh release view -R "$GITHUB_REPOSITORY" --json body -q .body 2>/dev/null || true)"
           build=true
-          if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 && [ "$FORCE" != "true" ]; then
+          if grep -qxF "$source" <<<"$latest" && [ "$FORCE" != "true" ]; then
             build=false
-            echo "$tag is released: nothing to do"
+            echo "the latest release is main ${main::8} with patch.sh ${patch::8}: nothing to do"
           fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          base="$(gh api "repos/${GITHUB_REPOSITORY}/contents/wandb/__init__.py?ref=${main}" -q .content \
+            | base64 -d | sed -n 's/^__version__ = "\(.*\)"$/\1/p')"
+          [ -n "$base" ] || { echo "::error::no __version__ in wandb/__init__.py at ${main}"; exit 1; }
+          label="gladia.$(date -u +%Y%m%d)"
+          n=1
+          while gh release view "v${base}-${label}$([ "$n" -gt 1 ] && echo ".$n")" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; do
+            n=$((n + 1))
+          done
+          [ "$n" -gt 1 ] && label="${label}.${n}"
+          tag="v${base}-${label}"
+          echo "main=$main" >> "$GITHUB_OUTPUT"
+          echo "label=$label" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "source=$source" >> "$GITHUB_OUTPUT"
           echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "$source -> $tag (build=$build)"
 
   build:
     name: Build manylinux ${{ matrix.arch }}
@@ -78,14 +104,17 @@ jobs:
           - { arch: x86_64, runner: ubuntu-24.04, go_arch: linux-amd64 }
           - { arch: aarch64, runner: ubuntu-24.04-arm, go_arch: linux-arm64 }
     steps:
+      # persist-credentials: false on both checkouts: the build below runs upstream's code, which must
+      # find no token in either .git/config
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: gladia
+          persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          repository: wandb/wandb
-          ref: v${{ needs.plan.outputs.version }}
+          ref: ${{ needs.plan.outputs.main }}
           path: src
+          persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: stable
@@ -93,7 +122,7 @@ jobs:
       - name: Apply the security floor
         working-directory: src
         run: |
-          ../gladia/patch.sh "gladia.${REV}"
+          ../gladia/patch.sh "${{ needs.plan.outputs.label }}"
           git diff --stat
       - name: Build the wheel
         uses: pypa/cibuildwheel@e090b81e30c4d855ea63bf4b6e59204c09a101ae # v4.2
@@ -118,7 +147,7 @@ jobs:
         run: |
           python -m venv /tmp/v
           /tmp/v/bin/pip install -q dist/*.whl
-          /tmp/v/bin/python -c "import wandb; v = wandb.__version__; print(v); assert v.endswith('+gladia.${REV}'), v"
+          /tmp/v/bin/python -c "import wandb; v = wandb.__version__; print(v); assert v.endswith('+${{ needs.plan.outputs.label }}'), v"
           core="$(/tmp/v/bin/python -c 'import wandb, pathlib; print(pathlib.Path(wandb.__file__).parent / "bin" / "wandb-core")')"
           go version "$core"
           go version -m "$core" | grep -E 'golang.org/x/net\s' || true
@@ -131,8 +160,12 @@ jobs:
     name: Scan and release
     needs: [plan, build]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write  # gh release create; the wheels are scanned and uploaded here, never run
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: wheel-*
@@ -151,16 +184,42 @@ jobs:
             mkdir -p "$d" && python3 -m zipfile -e "$whl" "$d"
           done
           /tmp/trivy rootfs --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 unpacked
+      # Latest, never a prerelease (main's version is a .dev one): images install the latest release.
+      # gh release create fails when the tag exists, so a release is never replaced.
       - name: Publish
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.plan.outputs.tag }}
-          VERSION: ${{ needs.plan.outputs.version }}
+          MAIN: ${{ needs.plan.outputs.main }}
+          SOURCE: ${{ needs.plan.outputs.source }}
         run: |
           (cd dist && sha256sum *.whl > SHA256SUMS && cat SHA256SUMS)
-          notes="wandb ${VERSION} (upstream tag v${VERSION}) with Gladia's security floor (patch.sh at ${GITHUB_SHA::8}). Package version ${VERSION}+gladia.${REV}."
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" dist/*.whl dist/SHA256SUMS --clobber
+          [ "$(grep -c 'manylinux_2_28_x86_64\.whl$' dist/SHA256SUMS)" = 1 ]
+          [ "$(grep -c 'manylinux_2_28_aarch64\.whl$' dist/SHA256SUMS)" = 1 ]
+          notes="wandb main at ${MAIN::8} (upstream, unreleased) with Gladia's security floor (patch.sh at ${GITHUB_SHA::8})."
+          gh release create "$TAG" dist/*.whl dist/SHA256SUMS --target "$GITHUB_SHA" --title "$TAG" --latest \
+            --notes "$(printf '%s\n\n%s\n' "$notes" "$SOURCE")"
+
+  # Any failed job (sync conflict, build, Trivy gate, publish): nothing was released, the latest release
+  # stays the last good one. One open issue collects the failed runs.
+  notify:
+    name: Report the failure
+    needs: [sync, plan, build, release]
+    if: failure()
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="Sync and release failed"
+          body="$(printf 'Run %s failed: nothing was released, the latest release is unchanged.\n' "$RUN")"
+          number="$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "\"$title\" in:title" \
+            --json number,title -q ".[] | select(.title == \"$title\") | .number" | head -1)"
+          if [ -n "$number" ]; then
+            gh issue comment "$number" -R "$GITHUB_REPOSITORY" --body "$body"
           else
-            gh release create "$TAG" dist/*.whl dist/SHA256SUMS --target "$GITHUB_SHA" --title "$TAG" --notes "$notes"
+            gh issue create -R "$GITHUB_REPOSITORY" --title "$title" --body "$body"
           fi
