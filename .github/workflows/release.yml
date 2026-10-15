@@ -1,0 +1,164 @@
+name: Sync and release
+
+# Every day: mirror upstream main into main, then build the latest upstream release with patch.sh
+# (Gladia's security floor) unless that build is already released. See README.md.
+on:
+  schedule:
+    - cron: "41 2 * * *"  # 02:41 UTC, before gladia-enterprise's nightly image scan (03:17)
+  workflow_dispatch:
+    inputs:
+      version:
+        description: upstream version to build (default the latest release), e.g. 0.30.0
+        required: false
+      force:
+        description: rebuild and replace the release when it exists
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  REV: "1"                 # bump when patch.sh changes: rebuilds the current upstream release
+  RUST_TOOLCHAIN: "1.88.0" # as upstream's release (xpu/Cargo.lock requires 1.88)
+  TRIVY_VERSION: "0.75.0"
+  TRIVY_SHA256: c6e65abddb348e25f10549df887045629cf28cc72453cd1c63acb717316b3f3f
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync main with upstream
+    runs-on: ubuntu-latest
+    steps:
+      # GITHUB_TOKEN cannot update .github/workflows: when upstream changed one, the merge needs
+      # SYNC_TOKEN (a token with the workflow scope on this repository)
+      - env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+        run: gh api -X POST "repos/${GITHUB_REPOSITORY}/merge-upstream" -f branch=main
+
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+      build: ${{ steps.plan.outputs.build }}
+    steps:
+      - id: plan
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          version="${VERSION#v}"
+          [ -n "$version" ] || version="$(gh api repos/wandb/wandb/releases/latest -q .tag_name)" && version="${version#v}"
+          tag="v${version}-gladia.${REV}"
+          build=true
+          if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 && [ "$FORCE" != "true" ]; then
+            build=false
+            echo "$tag is released: nothing to do"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build manylinux ${{ matrix.arch }}
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-24.04, go_arch: linux-amd64 }
+          - { arch: aarch64, runner: ubuntu-24.04-arm, go_arch: linux-arm64 }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: gladia
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: wandb/wandb
+          ref: v${{ needs.plan.outputs.version }}
+          path: src
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: stable
+          cache: false
+      - name: Apply the security floor
+        working-directory: src
+        run: |
+          ../gladia/patch.sh "gladia.${REV}"
+          git diff --stat
+      - name: Build the wheel
+        uses: pypa/cibuildwheel@e090b81e30c4d855ea63bf4b6e59204c09a101ae # v4.2
+        with:
+          package-dir: src
+          output-dir: dist
+        env:
+          CIBW_ARCHS_LINUX: ${{ matrix.arch }}
+          CIBW_BUILD: cp310-manylinux_${{ matrix.arch }}
+          CIBW_BEFORE_ALL_LINUX: >
+            export DOWNLOAD_GOVERSION=$( grep '^go ' core/go.mod | cut -d' ' -f2 ) &&
+            curl -fL https://golang.org/dl/go$DOWNLOAD_GOVERSION.${{ matrix.go_arch }}.tar.gz > go.tar.gz &&
+            tar -C /usr/local/ -xzf go.tar.gz &&
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
+              sh -s -- -y --profile minimal --default-toolchain ${{ env.RUST_TOOLCHAIN }}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+      - name: Smoke test
+        run: |
+          python -m venv /tmp/v
+          /tmp/v/bin/pip install -q dist/*.whl
+          /tmp/v/bin/python -c "import wandb; v = wandb.__version__; print(v); assert v.endswith('+gladia.${REV}'), v"
+          core="$(/tmp/v/bin/python -c 'import wandb, pathlib; print(pathlib.Path(wandb.__file__).parent / "bin" / "wandb-core")')"
+          go version "$core"
+          go version -m "$core" | grep -E 'golang.org/x/net\s' || true
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: wheel-${{ matrix.arch }}
+          path: dist/*.whl
+
+  release:
+    name: Scan and release
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: wheel-*
+          path: dist
+          merge-multiple: true
+      # Trivy is a release binary checked against its sha256 (the aquasecurity/trivy-action tags were
+      # hijacked in 2026-03), as gladia-enterprise's .github/actions/trivy-scan does
+      - name: Trivy gate (fixable HIGH / CRITICAL)
+        run: |
+          curl -fsSL --proto '=https' --retry 3 -o /tmp/trivy.tar.gz \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "${TRIVY_SHA256}  /tmp/trivy.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/trivy.tar.gz -C /tmp trivy
+          for whl in dist/*.whl; do
+            d="unpacked/$(basename "$whl" .whl)"
+            mkdir -p "$d" && python3 -m zipfile -e "$whl" "$d"
+          done
+          /tmp/trivy rootfs --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 unpacked
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          (cd dist && sha256sum *.whl > SHA256SUMS && cat SHA256SUMS)
+          notes="wandb ${VERSION} (upstream tag v${VERSION}) with Gladia's security floor (patch.sh at ${GITHUB_SHA::8}). Package version ${VERSION}+gladia.${REV}."
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.whl dist/SHA256SUMS --clobber
+          else
+            gh release create "$TAG" dist/*.whl dist/SHA256SUMS --target "$GITHUB_SHA" --title "$TAG" --notes "$notes"
+          fi
