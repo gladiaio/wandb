@@ -19,7 +19,7 @@ permissions:
   contents: write
 
 env:
-  REV: "1"                 # bump when patch.sh changes: rebuilds the current upstream release
+  REV: "2"                 # bump when patch.sh changes: rebuilds the current upstream release
   RUST_TOOLCHAIN: "1.88.0" # as upstream's release (xpu/Cargo.lock requires 1.88)
   TRIVY_VERSION: "0.75.0"
   TRIVY_SHA256: c6e65abddb348e25f10549df887045629cf28cc72453cd1c63acb717316b3f3f
