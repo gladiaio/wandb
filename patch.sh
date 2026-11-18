@@ -11,7 +11,7 @@ set -euo pipefail
 LABEL="${1:?usage: patch.sh <local version label, e.g. gladia.1>}"
 GO_MIN=1.27.3                       # CVE-2026-78667, CVE-2026-78669, CVE-2026-97031, CVE-2026-111943 (eMudhra) (Go stdlib)
 MODULES=(
-    "golang.org/x/net@v0.60.0"      # CVE-2026-78669
+    "golang.org/x/net@v0.62.0"      # CVE-2026-78669, CVE-2026-78661
 )
 
 # true when version $1 < version $2 (both without a leading v)
