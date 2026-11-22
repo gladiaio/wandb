@@ -19,7 +19,7 @@ permissions:
   contents: write
 
 env:
-  REV: "2"                 # bump when patch.sh changes: rebuilds the current upstream release
+  REV: "3"                 # bump when patch.sh changes: rebuilds the current upstream release
   RUST_TOOLCHAIN: "1.88.0" # as upstream's release (xpu/Cargo.lock requires 1.88)
   TRIVY_VERSION: "0.75.0"
   TRIVY_SHA256: c6e65abddb348e25f10549df887045629cf28cc72453cd1c63acb717316b3f3f
@@ -52,9 +52,21 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ inputs.version }}
           FORCE: ${{ inputs.force }}
+        # The latest upstream tag comes from the public /releases/latest redirect, without credentials:
+        # the wandb organization has an IP allow list, so any authenticated call from a runner (gh api
+        # with this token) answers 403, and that JSON body once became the version (2026-11-12 to 22).
+        # Anything but X.Y.Z fails here, never a green plan with a broken version.
         run: |
+          set -euo pipefail
           version="${VERSION#v}"
-          [ -n "$version" ] || version="$(gh api repos/wandb/wandb/releases/latest -q .tag_name)" && version="${version#v}"
+          if [ -z "$version" ]; then
+            latest="$(curl -fsSIL --proto '=https' --retry 3 -o /dev/null -w '%{url_effective}' https://github.com/wandb/wandb/releases/latest)"
+            version="${latest##*/releases/tag/v}"
+          fi
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::upstream version is not X.Y.Z: ${version:0:200}"
+            exit 1
+          fi
           tag="v${version}-gladia.${REV}"
           build=true
           if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 && [ "$FORCE" != "true" ]; then
@@ -81,11 +93,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: gladia
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          repository: wandb/wandb
-          ref: v${{ needs.plan.outputs.version }}
-          path: src
+      # A plain clone, without credentials: actions/checkout sends this repository's token, which the
+      # wandb organization's IP allow list refuses (see the plan step)
+      - name: Check out upstream
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: git clone --quiet --depth 1 --branch "v${VERSION}" https://github.com/wandb/wandb.git src
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: stable
